@@ -1,82 +1,102 @@
-// Tipos de datos extraídos del modelo de Pose Detection
 export interface Keypoint {
+  name: string;
   x: number;
   y: number;
   z?: number;
+  visibility?: number;
   score?: number;
-  name?: string;
 }
 
-/**
- * Calcula el ángulo en grados entre tres puntos (A, B, C)
- * B es el vértice.
- */
-export function calculateAngle(A: Keypoint, B: Keypoint, C: Keypoint): number {
-  const radians = Math.atan2(C.y - B.y, C.x - B.x) - Math.atan2(A.y - B.y, A.x - B.x);
-  let angle = Math.abs(radians * 180.0 / Math.PI);
-  
-  if (angle > 180.0) {
-    angle = 360 - angle;
-  }
-  return angle;
+export interface PostureEvaluation {
+  score: number;
+  state: 'optimal' | 'warning' | 'critical';
+  suggestion: string;
+  metrics: {
+    neckOffset: number;
+    shoulderTilt: number;
+    headHeight: number;
+  };
 }
 
-/**
- * Calcula la inclinación vertical del cuello (Cuello de texto)
- * Utiliza la oreja, el hombro y una línea vertical de referencia.
- */
-export function getNeckInclination(ear: Keypoint, shoulder: Keypoint): number {
-  // Punto virtual directamente encima del hombro para crear un eje vertical puro (90 grados)
-  const verticalRef: Keypoint = { x: shoulder.x, y: shoulder.y - 100 };
+export function evaluatePosture(keypoints: Keypoint[], thresholds?: any): PostureEvaluation {
+  const find = (name: string) => keypoints.find(k => k.name === name);
+
+  const nose = find('nose');
+  const leftS = find('left_shoulder');
+  const rightS = find('right_shoulder');
+
+  // Ajustes de sensibilidad basados en admin (0.1 a 1.5)
+  const sensitivity = thresholds?.sensitivity || 1.0;
   
-  // El ángulo del cuello respecto al eje vertical puro
-  const angle = calculateAngle(ear, shoulder, verticalRef);
-  return angle;
-}
+  let score = 100;
+  let state: 'optimal' | 'warning' | 'critical' = 'optimal';
+  let suggestion = "Postura Ergonómica Perfecta ✅";
 
-/**
- * Mide la asimetría de los hombros (desviación de altura)
- */
-export function getShoulderAsymmetry(leftShoulder: Keypoint, rightShoulder: Keypoint): number {
-  // Diferencia absoluta en el eje Y (altura)
-  const heightDifference = Math.abs(leftShoulder.y - rightShoulder.y);
-  return heightDifference;
-}
+  if (nose && leftS && rightS) {
+    // 1. CALIBRACIÓN RELATIVA: Usamos el ancho de los hombros como unidad de medida base
+    const shoulderWidth = Math.abs(leftS.x - rightS.x);
+    const midX = (leftS.x + rightS.x) / 2;
+    const midY = (leftS.y + rightS.y) / 2;
 
-export function evaluatePosture(keypoints: Keypoint[]) {
-  // En BlazePose/MoveNet:
-  // 3: left_ear, 4: right_ear
-  // 5: left_shoulder, 6: right_shoulder
-  
-  const leftEar = keypoints.find(k => k.name === 'left_ear');
-  const rightEar = keypoints.find(k => k.name === 'right_ear');
-  const leftShoulder = keypoints.find(k => k.name === 'left_shoulder');
-  const rightShoulder = keypoints.find(k => k.name === 'right_shoulder');
+    // 2. DESVIACIÓN HORIZONTAL DEL CUELLO (Relativa al ancho de hombros)
+    // Si la nariz se aleja más del 25% del ancho de los hombros del centro, hay mala postura.
+    const neckOffset = Math.abs(nose.x - midX) / shoulderWidth;
+    
+    // 3. INCLINACIÓN DE HOMBROS (Relativa al ancho de hombros)
+    const shoulderTilt = Math.abs(leftS.y - rightS.y) / shoulderWidth;
 
-  if (!leftEar || !rightEar || !leftShoulder || !rightShoulder) {
-    return { status: 'unknown', neckAngle: 0, asymmetry: 0 };
-  }
+    // 4. FACTOR DE ENCORVAMIENTO (Altura de la cabeza relativa a los hombros)
+    const headHeight = Math.abs(nose.y - midY) / shoulderWidth;
 
-  // Calculamos la inclinación promedio de ambos lados
-  const leftNeckAngle = getNeckInclination(leftEar, leftShoulder);
-  const rightNeckAngle = getNeckInclination(rightEar, rightShoulder);
-  const avgNeckAngle = (leftNeckAngle + rightNeckAngle) / 2;
+    // --- LÓGICA DE DECISIÓN COHERENTE ---
 
-  const asymmetry = getShoulderAsymmetry(leftShoulder, rightShoulder);
+    // Evaluar Cuello (Inclinación lateral o adelantada)
+    if (neckOffset > 0.3 * sensitivity) {
+      score -= 30;
+      state = 'critical';
+      suggestion = "🚨 Centra tu cabeza respecto a tus hombros.";
+    } else if (neckOffset > 0.15 * sensitivity) {
+      score -= 15;
+      state = 'warning';
+      suggestion = "🟡 Cabeza ligeramente inclinada.";
+    }
 
-  // Reglas matemáticas para ergonomía médica
-  // Tolerancia ideal: < 15 grados. Riesgo moderado: 15 a 25. Crítico: > 25 grados.
-  let status: 'optimal' | 'warning' | 'critical' = 'optimal';
-  
-  if (avgNeckAngle > 25 || asymmetry > 30) {
-    status = 'critical';
-  } else if (avgNeckAngle > 15 || asymmetry > 15) {
-    status = 'warning';
+    // Evaluar Hombros (Nivelación)
+    if (shoulderTilt > 0.2 * sensitivity) {
+      score -= 25;
+      if (state !== 'critical') state = 'critical';
+      suggestion = "🚨 Hombros desalineados. Nivela tu espalda.";
+    } else if (shoulderTilt > 0.1 * sensitivity) {
+      score -= 10;
+      if (state === 'optimal') {
+        state = 'warning';
+        suggestion = "🟡 Un hombro está más alto que el otro.";
+      }
+    }
+
+    // Evaluar Encorvamiento (Cabeza "hundida")
+    // Lo normal es que la cabeza esté a una distancia de ~0.5 a 0.7 del ancho de hombros
+    if (headHeight < 0.35 / sensitivity) {
+      score -= 40;
+      state = 'critical';
+      suggestion = "🚨 ¡TE ESTÁS ENCORVANDO! Levanta la cabeza y estira la espalda.";
+    } else if (headHeight < 0.45 / sensitivity) {
+      score -= 15;
+      if (state === 'optimal') {
+        state = 'warning';
+        suggestion = "🟡 No te hundas en la silla. Siéntate derecho.";
+      }
+    }
   }
 
   return {
-    status,
-    neckAngle: Math.round(avgNeckAngle),
-    asymmetry: Math.round(asymmetry)
+    score: Math.max(0, Math.round(score)),
+    state,
+    suggestion,
+    metrics: {
+      neckOffset: 0, 
+      shoulderTilt: 0,
+      headHeight: 0
+    }
   };
 }

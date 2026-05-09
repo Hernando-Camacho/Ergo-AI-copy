@@ -5,7 +5,7 @@ import { SignJWT } from 'jose';
 
 const pool = new Pool({
   user: 'ergoai_user',
-  host: 'localhost',
+  host: '127.0.0.1',
   database: 'ergoai_db',
   password: 'ergoai_password',
   port: 5433,
@@ -25,7 +25,7 @@ export async function POST(request: Request) {
     const client = await pool.connect();
     
     // Buscar usuario
-    const result = await client.query('SELECT id, role, full_name, hashed_password FROM users WHERE email = $1', [email]);
+    const result = await client.query('SELECT id, role, full_name, email, department, hashed_password FROM users WHERE email = $1', [email]);
     let userRole = 'user';
     let userName = email.split('@')[0];
     let userId = null;
@@ -57,7 +57,13 @@ export async function POST(request: Request) {
 
     // Generar JWT
     const alg = 'HS256';
-    const token = await new SignJWT({ email, role: userRole, name: userName, sub: userId.toString() })
+    const token = await new SignJWT({ 
+      email, 
+      role: userRole, 
+      name: userName, 
+      department: result.rows[0]?.department || "General",
+      sub: userId.toString() 
+    })
       .setProtectedHeader({ alg })
       .setIssuedAt()
       .setExpirationTime('24h')

@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from .config import settings
 
 # Usaremos PostgreSQL mediante Docker Compose en el puerto 5433
-SQLALCHEMY_DATABASE_URL = "postgresql://ergoai_user:ergoai_password@localhost:5433/ergoai_db" 
+SQLALCHEMY_DATABASE_URL = "postgresql://ergoai_user:ergoai_password@127.0.0.1:5433/ergoai_db" 
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL

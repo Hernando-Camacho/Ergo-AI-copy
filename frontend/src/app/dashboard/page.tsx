@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import Script from "next/script";
 import { Button } from "@/components/ui/button";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
@@ -9,431 +9,527 @@ import { drawSkeleton } from "@/lib/drawSkeleton";
 
 declare global {
   interface Window {
-    poseDetection: any;
-    tf: any;
+    Pose: any;
+    Camera: any;
   }
 }
 
 export default function DashboardPage() {
-  const [activeTab, setActiveTab] = useState<'calendar' | 'camera' | 'background'>('calendar');
+  const [mounted, setMounted] = useState(false);
+  const [activeTab, setActiveTab] = useState<'calendar' | 'camera' | 'profile'>('calendar');
   
-  // Model & Camera State
+  const [session, setSession] = useState<any>(null);
+  const [breaks, setBreaks] = useState<any[]>([]);
+  const [prescriptions, setPrescriptions] = useState<any[]>([]);
+  const [selectedPrescription, setSelectedPrescription] = useState<any>(null);
+  
+  const poseRef = useRef<any>(null);
+  const cameraRef = useRef<any>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [isCameraActive, setIsCameraActive] = useState(false);
-  const [tfLoaded, setTfLoaded] = useState(false);
-  const [modelReady, setModelReady] = useState(false);
-  
-  const detectorRef = useRef<any>(null);
-  const animationRef = useRef<number | null>(null);
 
-  // Biometrics & AI Suggestions
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isCameraLoading, setIsCameraLoading] = useState(false);
+
   const [biometricState, setBiometricState] = useState<'optimal' | 'warning' | 'critical'>('optimal');
   const [postureScore, setPostureScore] = useState(100);
-  const [debugData, setDebugData] = useState<{ angle: number, asym: number }>({ angle: 0, asym: 0 });
-  const [suggestion, setSuggestion] = useState("Listo para analizar tu postura. Inicia la cámara.");
-  const badPostureTimerRef = useRef<number>(0); // Contador de tiempo en mala postura
-  const lastNotificationRef = useRef<number>(0);
+  const [suggestion, setSuggestion] = useState("Listo para analizar.");
 
-  // Active Break Timer State
-  const [breakDuration, setBreakDuration] = useState(5); // in minutes
+  const [breakDuration, setBreakDuration] = useState(5);
   const [breakTimeLeft, setBreakTimeLeft] = useState(0);
   const [isBreakActive, setIsBreakActive] = useState(false);
+  const isBreakActiveRef = useRef(false);
+  const sessionScoresRef = useRef<number[]>([]);
+  const sessionRef = useRef<any>(null);
+  const [selectedBreak, setSelectedBreak] = useState<any>(null);
+  const [showResultModal, setShowResultModal] = useState(false);
+  const [lastSessionData, setLastSessionData] = useState<any>(null);
 
-  // Background Settings State
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [profileEmail, setProfileEmail] = useState("");
+  const [profileDept, setProfileDept] = useState("");
+  const [profilePass, setProfilePass] = useState("");
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [thresholds, setThresholds] = useState({ neck: 25, back: 15, sensitivity: 0.8 });
+  const thresholdsRef = useRef({ neck: 25, back: 15, sensitivity: 0.8 });
 
-  // Mock Calendar Data
-  const daysInMonth = Array.from({ length: 30 }, (_, i) => ({
-    day: i + 1,
-    status: Math.random() > 0.8 ? 'missed' : Math.random() > 0.2 ? 'active' : 'none'
-  }));
+  useEffect(() => { thresholdsRef.current = thresholds; }, [thresholds]);
 
-  const [chartData, setChartData] = useState([
-    { time: '09:00', score: 98 }, { time: '10:00', score: 85 }, { time: '11:00', score: 92 }
-  ]);
-
-  // Request Notification Permissions on load
-  useEffect(() => {
-    if ("Notification" in window) {
-      if (Notification.permission === "granted") {
-        setNotificationsEnabled(true);
-      }
+  const streak = useMemo(() => {
+    if (breaks.length === 0) return 0;
+    const days = Array.from(new Set(breaks.map(b => b.start_time.split('T')[0]))).sort().reverse();
+    const today = new Date().toISOString().split('T')[0];
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    if (!days.includes(today) && !days.includes(yesterday)) return 0;
+    let count = 0;
+    let checkDate = days.includes(today) ? new Date(today) : new Date(yesterday);
+    while (true) {
+      const checkStr = checkDate.toISOString().split('T')[0];
+      if (days.includes(checkStr)) {
+        count++;
+        checkDate.setDate(checkDate.getDate() - 1);
+      } else break;
     }
-  }, []);
+    return count;
+  }, [breaks]);
 
-  const requestNotifications = async () => {
-    if (!("Notification" in window)) {
-      alert("Este navegador no soporta notificaciones de escritorio");
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    setNotificationsEnabled(permission === "granted");
+  const last30Days = Array.from({length: 30}, (_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() - (29 - i));
+    return d;
+  });
+
+  const getRecommendations = (score: number) => {
+    if (score >= 90) return [{ icon: '🏆', text: 'Postura excepcional.' }, { icon: '💪', text: 'Tus hábitos son modelo.' }];
+    if (score >= 75) return [{ icon: '👍', text: 'Buena postura.' }, { icon: '⏱️', text: 'Toma pausas.' }];
+    return [{ icon: '🚨', text: 'Postura crítica.' }, { icon: '🧘', text: 'Estira el cuello.' }];
   };
 
-  // Initialize TensorFlow Model
   useEffect(() => {
-    if (tfLoaded && window.poseDetection && !detectorRef.current) {
-      const initModel = async () => {
-        try {
-          const detectorConfig = { modelType: window.poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
-          detectorRef.current = await window.poseDetection.createDetector(window.poseDetection.SupportedModels.MoveNet, detectorConfig);
-          setModelReady(true);
-        } catch (e) {
-          console.error("Error cargando modelo MoveNet:", e);
-        }
-      };
-      initModel();
-    }
-  }, [tfLoaded]);
+    setMounted(true);
+    const loadData = async () => {
+      try {
+        const sRes = await fetch('/api/auth/session');
+        if (!sRes.ok) return;
+        const sData = await sRes.json();
+        setSession(sData);
+        sessionRef.current = sData;
+        setProfileName(sData.name || "");
+        setProfileEmail(sData.email || "");
+        setProfileDept(sData.department || "");
 
-  // Main TF Loop
-  const processFrame = async () => {
-    if (!videoRef.current || !canvasRef.current || !detectorRef.current || !isCameraActive) return;
-    const video = videoRef.current;
+        const [bRes, pRes, cRes] = await Promise.all([
+          fetch(`/api/breaks?userId=${sData.id}`),
+          fetch(`/api/stats/prescriptions/user/${sData.id}`),
+          fetch('/api/stats/config')
+        ]);
+        if (bRes.ok) setBreaks(await bRes.json());
+        if (pRes.ok) {
+           const pData = await pRes.json();
+           setPrescriptions(pData.sort((a:any,b:any)=>new Date(b.created_at).getTime() - new Date(a.created_at).getTime()));
+        }
+        if (cRes.ok) {
+          const cData = await cRes.json();
+          setThresholds({
+            neck: parseInt(cData.neck_threshold || '25'),
+            back: parseInt(cData.back_threshold || '15'),
+            sensitivity: parseFloat(cData.sensitivity || '0.8')
+          });
+        }
+      } catch (e) { console.error(e); }
+    };
+    loadData();
+    const handleSync = (e: any) => {
+       setSession(e.detail);
+       setProfileName(e.detail.name || "");
+    };
+    window.addEventListener('profileUpdated', handleSync);
+    return () => window.removeEventListener('profileUpdated', handleSync);
+  }, []);
+
+  const handleUpdateProfile = async () => {
+    setIsUpdating(true);
+    try {
+      const res = await fetch('/api/auth/update-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: profileName, email: profileEmail, department: profileDept, password: profilePass })
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setSession(updated);
+        window.dispatchEvent(new CustomEvent('profileUpdated', { detail: updated }));
+        alert("Perfil actualizado");
+      }
+    } catch (e) { console.error(e); }
+    finally { setIsUpdating(false); }
+  };
+
+  const startIA = () => {
+    if (!(window as any).Pose || !videoRef.current) return;
+    const pose = new (window as any).Pose({
+      locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+    });
+    pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    pose.onResults((results: any) => {
+      if (!results.poseLandmarks || !canvasRef.current) return;
+      setIsCameraLoading(false);
+      const ctx = canvasRef.current.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0,0,640,480);
+      // Mapear índices de MediaPipe a nombres para que drawSkeleton los reconozca
+      const namedLandmarks = results.poseLandmarks.map((point: any, index: number) => {
+        const names: { [key: number]: string } = {
+          0: 'nose', 7: 'left_ear', 8: 'right_ear', 1: 'left_eye', 4: 'right_eye',
+          11: 'left_shoulder', 12: 'right_shoulder'
+        };
+        // Asegurar que pasamos visibility o score para que drawSkeleton filtre bien
+        return { 
+          ...point, 
+          visibility: point.visibility ?? 0,
+          name: names[index] || `point_${index}` 
+        };
+      });
+
+      drawSkeleton(namedLandmarks, ctx, 640, 480);
+      const evaluation = evaluatePosture(namedLandmarks, thresholdsRef.current);
+      
+      // Mostrar feedback siempre que la cámara esté activa
+      setPostureScore(evaluation.score);
+      setBiometricState(evaluation.state);
+      setSuggestion(evaluation.suggestion);
+
+      if (isBreakActiveRef.current) {
+         sessionScoresRef.current.push(evaluation.score);
+      }
+    });
+    poseRef.current = pose;
+    const camera = new (window as any).Camera(videoRef.current, {
+      onFrame: async () => { if (poseRef.current) await poseRef.current.send({ image: videoRef.current! }); },
+      width: 640, height: 480
+    });
+    camera.start();
+    cameraRef.current = camera;
+  };
+
+  const finishBreak = async () => {
+    const finalScore = sessionScoresRef.current.length > 0 
+      ? Math.round(sessionScoresRef.current.reduce((a,b)=>a+b,0)/sessionScoresRef.current.length) 
+      : 100;
     
-    if (video.readyState < 2) {
-      animationRef.current = requestAnimationFrame(processFrame);
-      return;
+    if (!session?.id) {
+       alert("Error: Sesión no identificada. No se pudo guardar.");
+       return;
     }
 
     try {
-      const width = video.videoWidth;
-      const height = video.videoHeight;
-      canvasRef.current.width = width;
-      canvasRef.current.height = height;
-
-      // Throttle if tab is hidden (Background Mode)
-      const isHidden = document.visibilityState === "hidden";
-      if (isHidden) {
-        await new Promise(r => setTimeout(r, 1000)); // Esperar 1 segundo si está en background
-      }
-
-      const poses = await detectorRef.current.estimatePoses(video);
-      const ctx = canvasRef.current.getContext('2d');
+      const res = await fetch('/api/breaks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          user_id: session.id, 
+          duration_seconds: breakDuration * 60, 
+          score: finalScore, 
+          metrics: { avg_score: finalScore } 
+        })
+      });
       
-      if (ctx && poses.length > 0) {
-        const keypoints = poses[0].keypoints as ErgoKeypoint[];
-        if (!isHidden) drawSkeleton(keypoints, ctx, width, height);
-
-        const evaluation = evaluatePosture(keypoints);
-        
-        // Update states sparingly (10% of frames when visible, 100% when hidden/slow)
-        if (isHidden || Math.random() < 0.1) {
-          setBiometricState(evaluation.status);
-          setDebugData({ angle: evaluation.neckAngle, asym: evaluation.asymmetry });
-          
-          if (evaluation.status === 'optimal') {
-            badPostureTimerRef.current = 0;
-            if (isBreakActive) {
-              setSuggestion("✅ Postura ideal para el ejercicio. Mantén la posición.");
-            } else {
-              setSuggestion("✅ Excelente ergonomía. Tienes alineación cervical perfecta.");
-            }
-            setPostureScore(prev => Math.min(100, prev + 1));
-          } else {
-            // Bad posture logic
-            badPostureTimerRef.current += isHidden ? 10 : 1; // Approx frames/seconds
-            setPostureScore(prev => Math.max(0, prev - 2));
-
-            if (badPostureTimerRef.current > 30) { // Approx 3 seconds of bad posture
-              setSuggestion(`⚠️ Cuello muy inclinado (${evaluation.neckAngle}°). ¡Haz rotaciones lentas hacia la izquierda!`);
-              
-              // Trigger Notification if Background
-              if (isHidden && notificationsEnabled) {
-                const now = Date.now();
-                if (now - lastNotificationRef.current > 60000) { // Limit to 1 per minute
-                  new Notification("ErgoAI: Alerta Ergonómica", {
-                    body: `Tu cuello lleva inclinado ${evaluation.neckAngle}°. Por favor, endereza tu espalda.`,
-                    icon: "/favicon.ico"
-                  });
-                  lastNotificationRef.current = now;
-                }
-              }
-            } else {
-              setSuggestion(`Precaución: Inclinación detectada (${evaluation.neckAngle}°). Corrige pronto.`);
-            }
-          }
+      if (res.ok) {
+        // Refrescar historial
+        const bRes = await fetch(`/api/breaks?userId=${session.id}`);
+        if (bRes.ok) {
+          const bData = await bRes.json();
+          setBreaks(bData);
         }
-      } else if (ctx) {
-        ctx.clearRect(0, 0, width, height);
+        setLastSessionData({ score: finalScore, suggestion, duration: breakDuration });
+        setShowResultModal(true);
+        // Alerta de confirmación para el usuario
+        alert("✅ Sesión guardada exitosamente en tu historial.");
+      } else {
+        const errData = await res.json();
+        alert(`❌ Error al guardar: ${errData.error || 'Desconocido'}`);
       }
-    } catch (e) {
+    } catch (e) { 
       console.error(e);
+      alert("⚠️ Error de conexión. Revisa que el servidor esté encendido.");
     }
-
-    if (isCameraActive) {
-      animationRef.current = requestAnimationFrame(processFrame);
-    }
+    
+    setIsBreakActive(false);
+    isBreakActiveRef.current = false;
+    setIsCameraActive(false);
+    if (cameraRef.current) cameraRef.current.stop();
+    if (poseRef.current) poseRef.current.close();
+    poseRef.current = null;
+    cameraRef.current = null;
   };
 
-  // Camera stream management
   useEffect(() => {
-    let stream: MediaStream | null = null;
-    if (isCameraActive) {
-      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
-        .then(s => {
-          stream = s;
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            videoRef.current.onloadeddata = () => processFrame();
-          }
-        })
-        .catch(console.error);
-    } else {
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      if (canvasRef.current) {
-        const ctx = canvasRef.current.getContext('2d');
-        if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-      }
-    }
-    return () => {
-      if (stream) stream.getTracks().forEach(track => track.stop());
-    };
-  }, [isCameraActive]);
-
-  // Break Timer loop
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let timer: any;
     if (isBreakActive && breakTimeLeft > 0) {
-      interval = setInterval(() => setBreakTimeLeft(prev => prev - 1), 1000);
+      timer = setInterval(() => setBreakTimeLeft(p => p - 1), 1000);
     } else if (isBreakActive && breakTimeLeft === 0) {
-      setIsBreakActive(false);
-      setIsCameraActive(false);
-      setSuggestion("🎉 ¡Pausa Activa completada exitosamente! Gran trabajo.");
-      alert("¡Pausa Activa Terminada! Tus estadísticas se han guardado.");
+      finishBreak();
     }
-    return () => clearInterval(interval);
+    return () => clearInterval(timer);
   }, [isBreakActive, breakTimeLeft]);
 
-  const startActiveBreak = () => {
-    if (!modelReady) {
-      alert("Espera un momento, los modelos de IA aún se están cargando...");
-      return;
-    }
-    setBreakTimeLeft(breakDuration * 60);
-    setIsBreakActive(true);
-    setIsCameraActive(true);
-    setSuggestion("Iniciando rutina... Siéntate derecho frente a la cámara.");
-    badPostureTimerRef.current = 0;
-  };
-
-  const formatTime = (seconds: number) => {
-    const m = Math.floor(seconds / 60);
-    const s = seconds % 60;
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  };
+  if (!mounted) return null;
 
   return (
-    <>
-      <Script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.2.0" strategy="beforeInteractive" />
-      <Script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.2.0" strategy="beforeInteractive" />
-      <Script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.2.0" strategy="beforeInteractive" />
-      <Script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3" strategy="beforeInteractive" onLoad={() => setTfLoaded(true)} />
+    <div className="space-y-8 pb-20 animate-in fade-in duration-700">
+      <Script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" strategy="afterInteractive" />
+      <Script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" strategy="afterInteractive" />
 
-      <div className="space-y-6 max-w-6xl mx-auto">
-        <div className="flex justify-between items-end">
+      <div className="flex justify-between items-center bg-white dark:bg-[#0B1B3D]/50 p-8 rounded-[2.5rem] shadow-xl border border-slate-100 dark:border-white/5">
+        <div className="flex items-center gap-6">
+          <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 flex items-center justify-center text-3xl border border-emerald-500/20 shadow-inner">👤</div>
           <div>
-            <h1 className="text-3xl font-bold tracking-tight mb-2 text-[#0B1B3D]">Portal de Salud Personal</h1>
-            <p className="text-slate-500 font-medium">Gestión integral de tu bienestar ergonómico.</p>
-          </div>
-          <div className="flex items-center gap-4">
-            {!modelReady && (
-              <span className="flex items-center text-xs font-bold text-amber-600 bg-amber-50 px-3 py-1 rounded border border-amber-200">
-                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse mr-2"></span>
-                Iniciando Motor IA...
-              </span>
-            )}
-            <div className={`px-4 py-2 rounded-lg border flex items-center gap-3 bg-white shadow-sm transition-all
-              ${biometricState === 'optimal' ? 'border-emerald-200' : biometricState === 'warning' ? 'border-yellow-200' : 'border-red-200'}`}
-            >
-              <span className="text-xs font-bold text-slate-500 uppercase">Estado</span>
-              <span className={`text-sm font-bold ${biometricState === 'optimal' ? 'text-emerald-600' : biometricState === 'warning' ? 'text-yellow-600' : 'text-red-600'}`}>
-                {biometricState === 'optimal' ? 'Óptimo' : biometricState === 'warning' ? 'Precaución' : 'Crítico'}
-              </span>
-            </div>
+            <h1 className="text-3xl font-black text-[#0B1B3D] dark:text-white tracking-tighter">¡Hola, {session?.name?.split(' ')[0] || 'Ergonauta'}!</h1>
+            <p className="text-slate-400 dark:text-blue-200/40 font-bold text-sm">Tu racha actual: <span className="text-orange-500">🔥 {streak} días</span></p>
           </div>
         </div>
-
-        {/* Custom Tabs Navigation */}
-        <div className="flex gap-4 border-b border-slate-200 pb-px">
-          <button onClick={() => setActiveTab("calendar")} className={`pb-2 text-sm font-bold border-b-2 transition-colors ${activeTab === "calendar" ? "border-[#0B1B3D] text-[#0B1B3D]" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
-            Resumen Mensual
-          </button>
-          <button onClick={() => setActiveTab("camera")} className={`pb-2 text-sm font-bold border-b-2 transition-colors ${activeTab === "camera" ? "border-emerald-600 text-emerald-600" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
-            Cámara & Pausa Activa IA
-          </button>
-          <button onClick={() => setActiveTab("background")} className={`pb-2 text-sm font-bold border-b-2 transition-colors flex items-center gap-2 ${activeTab === "background" ? "border-indigo-600 text-indigo-600" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
-            Monitoreo 2do Plano {notificationsEnabled && <span className="w-2 h-2 rounded-full bg-indigo-500"></span>}
-          </button>
+        <div className={`px-6 py-2 rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] shadow-lg ${biometricState === 'optimal' ? 'bg-emerald-500 text-white' : biometricState === 'warning' ? 'bg-yellow-500 text-white' : 'bg-red-600 text-white'}`}>
+           BIO: {biometricState}
         </div>
+      </div>
 
-        {/* TAB 1: CALENDAR & SUMMARY */}
-        {activeTab === "calendar" && (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                <p className="text-slate-500 text-sm font-bold uppercase tracking-wide">Pausas Realizadas</p>
-                <p className="text-4xl font-extrabold text-[#0B1B3D] mt-2">12 <span className="text-lg text-emerald-500 font-medium">este mes</span></p>
-              </div>
-              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                <p className="text-slate-500 text-sm font-bold uppercase tracking-wide">Puntaje Ergonómico Promedio</p>
-                <p className="text-4xl font-extrabold text-emerald-600 mt-2">92% <span className="text-lg text-slate-400 font-medium">/100</span></p>
-              </div>
-              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                <p className="text-slate-500 text-sm font-bold uppercase tracking-wide">Alertas Críticas</p>
-                <p className="text-4xl font-extrabold text-red-600 mt-2">3 <span className="text-lg text-slate-400 font-medium">corregidas</span></p>
-              </div>
-            </div>
+      <div className="flex p-1.5 bg-slate-200/40 dark:bg-white/5 rounded-2xl w-fit mx-auto backdrop-blur-sm">
+        {['calendar', 'camera', 'profile'].map(t => (
+          <button key={t} onClick={() => setActiveTab(t as any)} className={`px-10 py-3 rounded-xl text-xs font-black uppercase transition-all ${activeTab === t ? "bg-[#0B1B3D] dark:bg-emerald-500 text-white shadow-xl" : "text-slate-500 dark:text-blue-200/30 hover:text-white"}`}>
+             {t === 'calendar' ? 'Actividad' : t === 'camera' ? 'Cámara IA' : 'Configurar'}
+          </button>
+        ))}
+      </div>
 
-            <div className="bg-white border border-slate-200 rounded-xl p-8 shadow-sm">
-              <h3 className="text-lg font-bold text-[#0B1B3D] mb-6">Calendario de Actividad Ergonómica (Mayo)</h3>
-              <div className="grid grid-cols-7 gap-2 md:gap-4">
-                {['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'].map(d => (
-                  <div key={d} className="text-center text-xs font-bold text-slate-400 mb-2">{d}</div>
-                ))}
-                {daysInMonth.map((day, idx) => (
-                  <div 
-                    key={idx} 
-                    className={`aspect-square rounded-lg flex items-center justify-center text-sm font-bold border transition-all hover:scale-105 cursor-pointer
-                      ${day.status === 'active' ? 'bg-emerald-100 border-emerald-200 text-emerald-700 shadow-sm' : 
-                        day.status === 'missed' ? 'bg-red-50 border-red-100 text-red-500' : 
-                        'bg-slate-50 border-slate-100 text-slate-400'}`}
-                  >
-                    {day.day}
-                  </div>
-                ))}
-              </div>
-              <div className="mt-6 flex justify-end gap-6 text-sm">
-                <span className="flex items-center gap-2 text-slate-500"><div className="w-3 h-3 rounded bg-emerald-100 border border-emerald-200"></div> Pausa Completada</span>
-                <span className="flex items-center gap-2 text-slate-500"><div className="w-3 h-3 rounded bg-red-50 border border-red-100"></div> Postura Deficiente</span>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 2: ACTIVE BREAK & CAMERA */}
-        {activeTab === "camera" && (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="col-span-2 bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm flex flex-col">
-              <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                <h3 className="font-bold text-[#0B1B3D] flex items-center gap-2">
-                  Visión AI 
-                  {isCameraActive && <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>}
-                </h3>
-                <div className="flex gap-2">
-                  <Button 
-                    variant={isCameraActive && !isBreakActive ? "destructive" : "outline"}
-                    className={isCameraActive && !isBreakActive ? "" : "border-emerald-200 text-emerald-700"}
-                    onClick={() => setIsCameraActive(!isCameraActive)}
-                    disabled={isBreakActive}
-                  >
-                    {isCameraActive && !isBreakActive ? "Apagar Cámara" : "Probar Cámara"}
-                  </Button>
+      <div className="animate-in slide-in-from-bottom-10 duration-500">
+        {activeTab === 'calendar' && (
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
+            <div className="lg:col-span-3 space-y-8">
+              <div className="grid grid-cols-3 gap-6">
+                <div className="bg-white dark:bg-[#0B1B3D]/50 p-8 rounded-[2rem] border border-slate-100 dark:border-white/5 shadow-sm text-center">
+                  <p className="text-slate-400 dark:text-blue-200/40 text-[10px] font-black uppercase tracking-widest mb-4">Salud General</p>
+                  <p className="text-5xl font-black text-[#0B1B3D] dark:text-white">{breaks.length > 0 ? Math.round(breaks.reduce((a,b)=>a+b.score,0)/breaks.length) : 0}%</p>
                 </div>
-              </div>
-              <div className="flex-1 bg-[#050f24] min-h-[480px] relative flex items-center justify-center overflow-hidden">
-                {isCameraActive ? (
-                  <div className="relative w-full h-full flex items-center justify-center">
-                    <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-60 transform scale-x-[-1]" />
-                    <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full object-cover transform scale-x-[-1]" />
-                    {isBreakActive && (
-                      <div className="absolute top-4 right-4 bg-black/50 backdrop-blur-md border border-white/20 text-white px-6 py-3 rounded-xl shadow-2xl font-mono text-3xl font-bold">
-                        {formatTime(breakTimeLeft)}
+                <div className="bg-white dark:bg-[#0B1B3D]/50 p-8 rounded-[2rem] border border-slate-100 dark:border-white/5 shadow-sm text-center">
+                  <p className="text-slate-400 dark:text-blue-200/40 text-[10px] font-black uppercase tracking-widest mb-4">Sesiones</p>
+                  <p className="text-5xl font-black text-[#0B1B3D] dark:text-white">{breaks.length}</p>
+                </div>
+                <div className="bg-gradient-to-br from-[#0B1B3D] to-[#1C305C] p-8 rounded-[2rem] text-white shadow-2xl relative overflow-hidden group border border-white/10">
+                   <p className="text-blue-300 text-[10px] font-black uppercase tracking-widest mb-4">Alertas Médicas</p>
+                   {prescriptions.length > 0 ? (
+                      <div onClick={() => setSelectedPrescription(prescriptions[0])} className="cursor-pointer">
+                        <p className="text-sm font-black leading-tight mb-2 line-clamp-1">{prescriptions[0].title}</p>
+                        <p className="text-[10px] text-blue-200/60 font-bold line-clamp-2">{prescriptions[0].content}</p>
                       </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-slate-400 text-center">La cámara está inactiva.<br/>Pulsa iniciar rutina para comenzar.</div>
-                )}
+                   ) : <p className="text-sm font-bold text-blue-200/40 italic">Todo bajo control.</p>}
+                   <div className="absolute -right-4 -bottom-4 text-6xl opacity-5">🩺</div>
+                </div>
+              </div>
+
+              {/* Calendario y Registros Debajo */}
+              <div className="space-y-8">
+                <div className="bg-white dark:bg-[#0B1B3D]/50 p-10 rounded-[3rem] border border-slate-100 dark:border-white/5 shadow-sm">
+                   <h3 className="text-xl font-black text-[#0B1B3D] dark:text-white mb-8 text-center">Calendario de Cumplimiento</h3>
+                   <div className="grid grid-cols-10 gap-3">
+                     {last30Days.map((date, i) => {
+                       const dateStr = date.toISOString().split('T')[0];
+                       const hasBreak = breaks.some(b => b.start_time.startsWith(dateStr));
+                       return (
+                         <div key={i} title={dateStr} className={`aspect-square rounded-xl flex items-center justify-center text-[10px] font-black border-2 ${hasBreak ? 'bg-emerald-500 border-emerald-600 text-white shadow-md' : 'bg-slate-50 dark:bg-white/5 border-slate-100 dark:border-white/5 text-slate-300'}`}>
+                           {date.getDate()}
+                         </div>
+                       );
+                     })}
+                   </div>
+                </div>
+
+                <div className="bg-white dark:bg-[#0B1B3D]/50 p-10 rounded-[3rem] border border-slate-100 dark:border-white/5 shadow-sm">
+                   <h3 className="text-lg font-black text-[#0B1B3D] dark:text-white mb-6">Últimos 5 Registros</h3>
+                   <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                      {breaks.slice(0, 5).map((b, i) => (
+                        <div key={i} onClick={() => setSelectedBreak(b)} className={`p-5 rounded-[2rem] border transition-all cursor-pointer text-center ${selectedBreak?.id === b.id ? 'bg-emerald-500/10 border-emerald-500' : 'bg-slate-50 dark:bg-white/5 border-slate-100 dark:border-white/5 hover:border-slate-300'}`}>
+                           <p className="text-[10px] font-black text-slate-400 uppercase mb-2">{new Date(b.start_time).toLocaleDateString([], {day:'2-digit', month:'short'})}</p>
+                           <p className="text-2xl font-black text-emerald-500">{b.score}%</p>
+                           <p className="text-[8px] font-black text-slate-300 uppercase mt-1">{Math.round(b.duration_seconds/60)} min</p>
+                        </div>
+                      ))}
+                      {breaks.length === 0 && <p className="col-span-5 text-center text-xs font-bold text-slate-300 py-4">No hay registros aún.</p>}
+                   </div>
+                </div>
               </div>
             </div>
 
-            <div className="space-y-6">
-              {!isBreakActive ? (
-                <div className="bg-white border border-emerald-200 rounded-xl p-6 shadow-md shadow-emerald-900/5">
-                  <div className="w-12 h-12 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mb-4">
-                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                  </div>
-                  <h3 className="font-bold text-[#0B1B3D] mb-2 text-xl">Rutina de Pausa Activa</h3>
-                  <p className="text-sm text-slate-500 mb-6">La IA de MediaPipe corregirá tus posturas y contará tu tiempo de relajación muscular.</p>
-                  
-                  <div className="flex gap-2 mb-6">
-                    {[3, 5, 10].map(min => (
-                      <button key={min} onClick={() => setBreakDuration(min)} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all border ${breakDuration === min ? 'bg-emerald-600 border-emerald-700 text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}`}>
-                        {min} min
-                      </button>
-                    ))}
-                  </div>
-                  
-                  <Button onClick={startActiveBreak} className="w-full h-12 bg-[#0B1B3D] hover:bg-[#1C305C] text-white font-bold text-lg rounded-xl">
-                    Comenzar Rutina
-                  </Button>
-                </div>
-              ) : (
-                <div className="bg-[#0B1B3D] rounded-xl p-6 shadow-xl relative overflow-hidden">
-                  <div className="absolute -top-10 -right-10 w-40 h-40 bg-emerald-500/20 rounded-full blur-3xl"></div>
-                  <h3 className="font-bold text-white mb-2 flex items-center gap-2 text-lg">Entrenador IA</h3>
-                  <p className="text-emerald-400 font-medium mb-6 animate-pulse">Analizando tu alineación cervical...</p>
-                  
-                  <div className={`p-5 rounded-xl border mb-6 backdrop-blur-md transition-colors ${
-                    biometricState === 'critical' ? 'bg-red-500/20 border-red-500/50 text-red-100' :
-                    biometricState === 'warning' ? 'bg-yellow-500/20 border-yellow-500/50 text-yellow-100' :
-                    'bg-white/10 border-white/20 text-blue-50'
-                  }`}>
-                    <p className="font-medium leading-relaxed text-lg">{suggestion}</p>
-                  </div>
-
-                  <Button onClick={() => { setIsBreakActive(false); setIsCameraActive(false); }} variant="destructive" className="w-full font-bold">
-                    Abortar Rutina
-                  </Button>
-                </div>
-              )}
+            <div className="bg-white dark:bg-[#0B1B3D]/50 p-8 rounded-[2.5rem] border border-slate-100 dark:border-white/5 shadow-xl flex flex-col">
+                 <h3 className="text-lg font-black text-[#0B1B3D] dark:text-white mb-6">Detalles del Día</h3>
+                 {selectedBreak ? (
+                   <div className="space-y-6">
+                      <div className="bg-slate-50 dark:bg-black/20 p-8 rounded-3xl border border-slate-100 dark:border-white/5 text-center shadow-inner">
+                         <p className="text-6xl font-black text-emerald-500">{selectedBreak.score}%</p>
+                         <p className="text-[10px] font-black text-slate-400 uppercase mt-3 tracking-widest">Calidad de Postura</p>
+                      </div>
+                      <div className="space-y-4">
+                         {getRecommendations(selectedBreak.score).map((r,i)=>(
+                           <div key={i} className="flex items-center gap-4 p-4 bg-white dark:bg-white/5 rounded-2xl border border-slate-100 dark:border-white/5 shadow-sm">
+                             <span className="text-2xl">{r.icon}</span>
+                             <p className="text-[11px] font-bold text-slate-600 dark:text-blue-100/80 leading-snug">{r.text}</p>
+                           </div>
+                         ))}
+                      </div>
+                   </div>
+                 ) : (
+                   <div className="flex-1 flex flex-col items-center justify-center text-center opacity-30">
+                      <div className="text-6xl mb-6">📉</div>
+                      <p className="text-xs font-black uppercase tracking-[0.2em]">Selecciona una sesión</p>
+                   </div>
+                 )}
             </div>
           </div>
         )}
 
-        {/* TAB 3: BACKGROUND MONITORING */}
-        {activeTab === "background" && (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 bg-white border border-slate-200 rounded-xl p-8 shadow-sm max-w-2xl mx-auto text-center">
-            <div className="w-20 h-20 bg-indigo-50 border border-indigo-100 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-              <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
-            </div>
-            <h2 className="text-2xl font-bold text-[#0B1B3D] mb-4">Guardián Ergonómico Constante</h2>
-            <p className="text-slate-600 text-lg mb-8">
-              Activa la cámara y continúa trabajando en otras pestañas. ErgoAI bajará su consumo a 1 frame por segundo y te enviará una notificación a tu escritorio si detecta que te encorvas.
-            </p>
-            
-            <div className="flex flex-col gap-4 max-w-xs mx-auto">
-              {!notificationsEnabled ? (
-                <Button onClick={requestNotifications} className="h-12 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-md shadow-lg">
-                  Permitir Notificaciones
-                </Button>
-              ) : (
-                <div className="px-4 py-3 bg-indigo-50 border border-indigo-200 text-indigo-700 font-bold rounded-lg mb-4 flex items-center justify-center gap-2">
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                  Notificaciones Autorizadas
-                </div>
-              )}
+        {activeTab === 'camera' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2 aspect-video bg-[#050f24] rounded-[3rem] overflow-hidden relative shadow-2xl border-4 border-slate-200">
+               {isCameraActive ? (
+                  <>
+                   <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-60" style={{transform: 'scaleX(-1)'}} />
+                   <canvas ref={canvasRef} width="640" height="480" className="absolute top-0 left-0 w-full h-full object-cover" style={{transform: 'scaleX(-1)'}} />
+                   
+                   {/* Capa de Cronómetro y Puntos */}
+                   <div className="absolute inset-0 pointer-events-none border-[12px] border-[#0B1B3D]/30 z-10"></div>
+                   
+                   {isBreakActive && !isCameraLoading && (
+                      <div className="absolute top-10 right-10 z-30 bg-[#0B1B3D]/90 backdrop-blur-xl px-8 py-4 rounded-[2rem] border border-blue-500/30 shadow-2xl text-center">
+                         <span className="text-[8px] font-black text-blue-400 uppercase tracking-[0.3em] block mb-2">TIEMPO IA</span>
+                         <span className="text-4xl font-mono font-black text-white">
+                           {Math.floor(breakTimeLeft / 3600).toString().padStart(2, '0')}:
+                           {Math.floor((breakTimeLeft % 3600) / 60).toString().padStart(2, '0')}:
+                           {(breakTimeLeft % 60).toString().padStart(2, '0')}
+                         </span>
+                      </div>
+                   )}
+                   
+                   {isCameraLoading && (
+                      <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-[#050f24]/90 backdrop-blur-sm">
+                         <div className="w-16 h-16 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+                         <p className="text-emerald-400 font-mono text-xs font-black tracking-[0.5em] animate-pulse">CARGANDO MOTOR BIOMÉTRICO</p>
+                      </div>
+                   )}
 
-              <Button 
-                onClick={() => setIsCameraActive(!isCameraActive)}
-                disabled={!notificationsEnabled}
-                variant={isCameraActive ? "destructive" : "default"}
-                className={`h-12 font-bold text-md shadow-md ${!isCameraActive && notificationsEnabled ? "bg-[#0B1B3D] hover:bg-[#1C305C]" : ""}`}
-              >
-                {isCameraActive ? "Apagar Guardián" : "Encender Guardián"}
-              </Button>
+                   <div className="absolute bottom-10 left-10 flex items-center gap-3 z-20">
+                      <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse shadow-[0_0_15px_red]"></div>
+                      <span className="text-white font-mono text-xs font-black bg-black/50 px-3 py-1.5 rounded-lg tracking-widest uppercase">REC • IA ACTIVE</span>
+                   </div>
+                  </>
+               ) : (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900">
+                     <div className="w-20 h-20 rounded-3xl bg-white/5 border border-white/10 flex items-center justify-center text-4xl mb-6">📷</div>
+                     <p className="text-slate-500 font-black tracking-widest uppercase text-xs mb-8">Cámara en Reposo</p>
+                     <Button onClick={() => { setIsCameraActive(true); setIsCameraLoading(true); setTimeout(startIA, 1000); }} className="bg-white hover:bg-slate-200 text-[#0B1B3D] font-black px-12 py-5 rounded-2xl shadow-2xl transition-all hover:scale-105">INICIAR CÁMARA</Button>
+                  </div>
+               )}
             </div>
-            
-            {isCameraActive && (
-              <p className="mt-8 text-sm font-bold text-emerald-600 animate-pulse bg-emerald-50 py-2 px-4 rounded-full inline-block border border-emerald-200">
-                Guardián activo. Puedes minimizar esta ventana o cambiar de pestaña.
-              </p>
-            )}
+            <div className="space-y-6">
+               {!isBreakActive ? (
+                  <div className="bg-white dark:bg-[#0B1B3D]/50 p-10 rounded-[3rem] border border-slate-100 dark:border-white/5 shadow-xl text-center">
+                     <h3 className="text-xl font-black text-[#0B1B3D] dark:text-white mb-8">Entrenamiento IA</h3>
+                     <div className="space-y-6 mb-10 text-left">
+                        <div className="space-y-3">
+                           <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Duración (Minutos)</label>
+                           <input 
+                             type="number" 
+                             min="1" 
+                             max="120" 
+                             value={isNaN(breakDuration) ? "" : breakDuration} 
+                             onChange={e => {
+                               const val = parseInt(e.target.value);
+                               setBreakDuration(isNaN(val) ? 1 : Math.max(1, val));
+                             }} 
+                             className="w-full h-16 px-8 rounded-2xl bg-slate-50 dark:bg-white/5 border-2 border-slate-100 dark:border-white/5 font-black text-2xl text-center focus:border-emerald-500 outline-none transition-all shadow-inner" 
+                           />
+                        </div>
+                     </div>
+                     <Button onClick={()=>{ setIsBreakActive(true); isBreakActiveRef.current=true; setIsCameraActive(true); setIsCameraLoading(true); setBreakTimeLeft(breakDuration*60); sessionScoresRef.current=[]; setTimeout(startIA, 1000); }} className="w-full h-20 bg-[#0B1B3D] hover:bg-[#1C305C] text-white font-black text-lg rounded-[2rem] shadow-2xl transition-all hover:scale-[1.02]">ACTIVAR ANÁLISIS</Button>
+                  </div>
+               ) : (
+                  <div className={`p-12 rounded-[3.5rem] text-white shadow-2xl text-center animate-in zoom-in duration-500 relative overflow-hidden transition-colors duration-500 ${
+                    biometricState === 'optimal' ? 'bg-emerald-600' : 
+                    biometricState === 'warning' ? 'bg-yellow-500' : 
+                    'bg-red-600 animate-pulse'
+                  }`}>
+                     <div className="relative z-10">
+                        <h3 className="text-3xl font-black mb-6 tracking-tighter uppercase">
+                          {biometricState === 'optimal' ? '✅ Postura Óptima' : 
+                           biometricState === 'warning' ? '⚠️ Atención' : 
+                           '🚨 Corregir Ahora'}
+                        </h3>
+                        <div className="bg-white/20 backdrop-blur-md p-8 rounded-3xl mb-10 border border-white/20 shadow-inner">
+                           <p className="text-white text-xl font-black leading-relaxed">{suggestion}</p>
+                        </div>
+                        <Button onClick={finishBreak} className="w-full h-16 bg-white text-[#0B1B3D] font-black rounded-2xl hover:bg-slate-100 transition-all shadow-xl text-lg">FINALIZAR Y GUARDAR</Button>
+                     </div>
+                     <div className="absolute -bottom-10 -right-10 text-[12rem] opacity-10 font-black tracking-tighter">
+                        {biometricState === 'optimal' ? 'OK' : biometricState === 'warning' ? '!!' : '!!'}
+                     </div>
+                  </div>
+               )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'profile' && (
+          <div className="max-w-2xl mx-auto">
+             <div className="bg-white dark:bg-[#0B1B3D]/50 p-12 rounded-[4rem] border border-slate-100 dark:border-white/5 shadow-2xl">
+                <div className="flex items-center gap-6 mb-12">
+                   <div className="w-24 h-24 rounded-[2.5rem] bg-emerald-500/10 flex items-center justify-center text-5xl border border-emerald-500/20 shadow-inner">👤</div>
+                   <div>
+                      <h3 className="text-4xl font-black text-[#0B1B3D] dark:text-white tracking-tighter">Mi Perfil</h3>
+                      <p className="text-slate-400 dark:text-blue-200/40 font-bold uppercase text-[10px] tracking-[0.3em] mt-2">Identidad ErgoAI</p>
+                   </div>
+                </div>
+                <div className="space-y-8">
+                   <div className="grid grid-cols-2 gap-6">
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Nombre</label>
+                        <input type="text" value={profileName} onChange={e=>setProfileName(e.target.value)} className="w-full h-14 px-6 rounded-2xl bg-slate-50 dark:bg-white/5 border border-slate-100 dark:border-white/5 font-black focus:border-emerald-500 outline-none transition-all shadow-sm" />
+                      </div>
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Dpto.</label>
+                        <input type="text" value={profileDept} onChange={e=>setProfileDept(e.target.value)} className="w-full h-14 px-6 rounded-2xl bg-slate-50 dark:bg-white/5 border border-slate-100 dark:border-white/5 font-black focus:border-emerald-500 outline-none transition-all shadow-sm" />
+                      </div>
+                   </div>
+                   <div className="space-y-3">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Email</label>
+                      <input type="email" value={profileEmail} onChange={e=>setProfileEmail(e.target.value)} className="w-full h-14 px-6 rounded-2xl bg-slate-50 dark:bg-white/5 border border-slate-100 dark:border-white/5 font-black focus:border-emerald-500 outline-none transition-all shadow-sm" />
+                   </div>
+                   <div className="space-y-3">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Password</label>
+                      <input type="password" value={profilePass} onChange={e=>setProfilePass(e.target.value)} placeholder="••••••••" className="w-full h-14 px-6 rounded-2xl bg-slate-50 dark:bg-white/5 border border-slate-100 dark:border-white/5 font-black focus:border-emerald-500 outline-none transition-all shadow-sm" />
+                   </div>
+                   <Button onClick={handleUpdateProfile} disabled={isUpdating} className="w-full h-18 bg-[#0B1B3D] dark:bg-emerald-600 text-white font-black text-lg rounded-[2rem] shadow-2xl mt-6 hover:scale-[1.02] transition-all">
+                      {isUpdating ? "GUARDANDO..." : "ACTUALIZAR DATOS"}
+                   </Button>
+                </div>
+             </div>
           </div>
         )}
       </div>
-    </>
+
+      {showResultModal && lastSessionData && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-[#0B1B3D]/80 backdrop-blur-md animate-in fade-in duration-500">
+          <div className="bg-white dark:bg-[#0B1B3D] w-full max-w-lg rounded-[4rem] p-16 text-center border border-white/10 animate-in zoom-in duration-500 shadow-[0_0_80px_rgba(16,185,129,0.3)]">
+             <div className="text-8xl font-black text-emerald-500 mb-4 tracking-tighter">{lastSessionData.score}%</div>
+             <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.4em] mb-12">Calificación ErgoAI</p>
+             <h2 className="text-4xl font-black text-[#0B1B3D] dark:text-white mb-8 tracking-tight">¡Sesión Exitosa!</h2>
+             <p className="text-sm font-bold text-slate-500 dark:text-blue-200/60 leading-relaxed mb-12 max-w-xs mx-auto">{lastSessionData.suggestion}</p>
+             <Button onClick={() => setShowResultModal(false)} className="w-full h-18 bg-emerald-600 text-white font-black text-lg rounded-[2rem] shadow-xl hover:scale-105 transition-all">GENIAL</Button>
+          </div>
+        </div>
+      )}
+
+      {selectedPrescription && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-[#0B1B3D]/80 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="bg-white dark:bg-[#0B1B3D] w-full max-w-lg rounded-[3.5rem] shadow-2xl overflow-hidden animate-in zoom-in duration-500 border border-white/10">
+             <div className="p-12 bg-indigo-600 text-white relative">
+                <p className="text-[10px] font-black uppercase tracking-[0.3em] opacity-60 mb-3">Centro de Triage</p>
+                <h2 className="text-3xl font-black tracking-tighter">{selectedPrescription.title}</h2>
+                <div className="absolute top-10 right-10 text-6xl opacity-10">🩺</div>
+             </div>
+             <div className="p-12 space-y-8">
+                <div className="bg-slate-50 dark:bg-white/5 p-10 rounded-[2.5rem] border border-slate-100 dark:border-white/5">
+                   <p className="text-xl font-medium leading-relaxed text-slate-800 dark:text-white">{selectedPrescription.content || selectedPrescription.description}</p>
+                </div>
+                <div className="flex items-center gap-5">
+                   <div className="w-14 h-14 rounded-full bg-slate-100 dark:bg-white/10 flex items-center justify-center text-3xl">👤</div>
+                   <div>
+                      <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Emitido por</p>
+                      <p className="text-sm font-bold text-indigo-600">Especialista ErgoAI</p>
+                   </div>
+                </div>
+                <Button onClick={() => setSelectedPrescription(null)} className="w-full h-18 bg-[#0B1B3D] dark:bg-white dark:text-[#0B1B3D] text-white font-black text-lg rounded-[2rem] shadow-xl hover:scale-105 transition-all">ENTENDIDO</Button>
+             </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
