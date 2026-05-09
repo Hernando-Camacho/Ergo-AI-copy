@@ -3,11 +3,11 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from .config import settings
 
-# Usaremos SQLite para desarrollo rápido en Mint
-SQLALCHEMY_DATABASE_URL = "sqlite:///./ergoai.db" 
+# Usaremos PostgreSQL mediante Docker Compose en el puerto 5433
+SQLALCHEMY_DATABASE_URL = "postgresql://ergoai_user:ergoai_password@localhost:5433/ergoai_db" 
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
