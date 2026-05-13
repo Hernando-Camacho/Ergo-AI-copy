@@ -1,9 +1,10 @@
 from fastapi import APIRouter
-from app.api import auth, breaks, prescriptions, config, stats
+from app.api import auth, breaks, prescriptions, config, stats, users
 
 router = APIRouter()
 
 router.include_router(auth.router)
+router.include_router(users.router)
 router.include_router(breaks.router)
 router.include_router(prescriptions.router)
 router.include_router(config.router)

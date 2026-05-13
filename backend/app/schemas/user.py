@@ -18,3 +18,12 @@ class UserResponse(UserBase):
 
     class Config:
         from_attributes = True # Esto permite que Pydantic lea modelos de SQLAlchemy
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse

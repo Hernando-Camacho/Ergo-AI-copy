@@ -1,13 +1,6 @@
 import { NextResponse } from 'next/server';
-import { Pool } from 'pg';
 
-const pool = new Pool({
-  user: 'ergoai_user',
-  host: 'localhost',
-  database: 'ergoai_db',
-  password: 'ergoai_password',
-  port: 5433,
-});
+const BACKEND_URL = 'http://localhost:8000';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -18,17 +11,25 @@ export async function GET(request: Request) {
   }
 
   try {
-    const client = await pool.connect();
-    const result = await client.query('SELECT role FROM users WHERE email = $1', [email]);
-    client.release();
+    // Nota: Deberíamos tener un endpoint específico en el backend para esto o usar el de 'me'
+    // Por ahora, usamos el endpoint de lista de usuarios filtrando si el que pide es admin,
+    // o simplemente devolvemos el rol del token si es el mismo usuario.
+    const token = request.headers.get('cookie')?.split('ergoai_token=')[1]?.split(';')[0];
+    
+    const response = await fetch(`${BACKEND_URL}/auth/me`, {
+      headers: {
+        'Authorization': `Bearer ${token}`
+      }
+    });
 
-    if (result.rows.length > 0) {
-      return NextResponse.json({ role: result.rows[0].role });
-    } else {
-      return NextResponse.json({ role: 'user', error: 'User not found' }, { status: 404 });
+    if (!response.ok) {
+        return NextResponse.json({ role: 'user' });
     }
+
+    const userData = await response.json();
+    return NextResponse.json({ role: userData.role });
   } catch (error) {
-    console.error('Database error:', error);
+    console.error('Proxy error:', error);
     return NextResponse.json({ role: 'user', error: 'Internal Server Error' }, { status: 500 });
   }
 }
