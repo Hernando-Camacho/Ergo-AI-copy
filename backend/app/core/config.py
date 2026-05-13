@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # Base de datos
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://ergoai_user:ergoai_password@localhost:5433/ergoai_db")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_FvrYZD6L1lzy@ep-lingering-sun-aqvlrk5p-pooler.c-8.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 
     # CORS
     CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
